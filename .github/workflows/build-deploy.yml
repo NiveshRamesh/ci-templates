@@ -1,0 +1,459 @@
+# =============================================================================
+# Reusable build pipeline. Runs on every push to feature/*, develop, release/*.
+#
+#  1. Versioning     - branch -> image tag (feat-<JIRA>-bN | main-bN | NG-x.y.z-bN),
+#                      Jira ticket, Hanoi target branch
+#  2. Build & Scan   - build image locally -> Trivy image scan (gate) -> SBOM
+#                      -> DAST (OWASP ZAP baseline against the running container)
+#                      -> push to GHCR only if everything above passed
+#  3. Sign & Attest  - Cosign keyless signature + SBOM attestation + SLSA provenance
+#  4. Update Hanoi   - write the tag into hanoi/<same branch>/helm-charts/<chart>/values.yaml
+#  5. Notify Jira    - success / failure comment on the ticket
+#
+# Any failed step stops the chain, so Hanoi keeps the previous (good) tag.
+# =============================================================================
+name: Build & Deploy
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Image name. Default: repository name"
+        type: string
+        default: ""
+      chart-name:
+        description: "Folder under hanoi/helm-charts. Default: service-name"
+        type: string
+        default: ""
+      dockerfile:
+        type: string
+        default: Dockerfile
+      context:
+        type: string
+        default: "."
+      app-port:
+        description: "Port the container listens on (used for DAST)"
+        type: number
+        default: 8080
+      health-path:
+        type: string
+        default: /health
+      dast:
+        description: "Run OWASP ZAP baseline against the freshly built container"
+        type: boolean
+        default: true
+      zap-rules-file:
+        type: string
+        default: .zap/rules.tsv
+      block-severity:
+        description: "Image vulnerabilities (with a fix available) at these levels block the push"
+        type: string
+        default: CRITICAL,HIGH
+      provenance:
+        description: "GitHub artifact attestation (SLSA provenance). Needs a public repo or GitHub Enterprise."
+        type: boolean
+        default: true
+      hanoi-repo:
+        type: string
+        default: hanoi
+    secrets:
+      CICD_APP_CLIENT_ID:
+        required: true
+      CICD_APP_PRIVATE_KEY:
+        required: true
+      JIRA_URL:
+        required: false
+      JIRA_USERNAME:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+    outputs:
+      image:
+        value: ${{ jobs.versioning.outputs.image }}
+      tag:
+        value: ${{ jobs.versioning.outputs.tag }}
+      digest:
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  TRIVY_VERSION: "v0.76.1"
+  TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  versioning:
+    name: Versioning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      branch-type: ${{ steps.v.outputs.branch_type }}
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      image: ${{ steps.v.outputs.image }}
+      image-name: ${{ steps.v.outputs.image_name }}
+      chart: ${{ steps.v.outputs.chart }}
+      hanoi-branch: ${{ steps.v.outputs.hanoi_branch }}
+      jira-ticket: ${{ steps.v.outputs.ticket }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Compute tag from branch
+        id: v
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          SERVICE_INPUT: ${{ inputs.service-name }}
+          CHART_INPUT: ${{ inputs.chart-name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          JIRA_RE='[A-Z][A-Z0-9]+-[0-9]+'
+          SERVICE="${SERVICE_INPUT:-$REPO}"; SERVICE="${SERVICE,,}"
+          CHART="${CHART_INPUT:-$SERVICE}"
+          OWNER_LC="${OWNER,,}"
+          # Ticket from squash-commit title (PR title), used on develop/release
+          ticket_from_commit() { printf '%s' "$COMMIT_MSG" | head -n1 | grep -oE "$JIRA_RE" | head -n1 || true; }
+          VERSION=""
+
+          case "$REF_NAME" in
+            feature/*)
+              ID="${REF_NAME#feature/}"
+              if [[ ! "$ID" =~ ^${JIRA_RE}$ ]]; then
+                echo "::error::Feature branches must be feature/<PROJECT>-<NUMBER> (e.g. feature/CCBD-1234). Got '$REF_NAME'."
+                exit 1
+              fi
+              TYPE=feature; TAG="feat-${ID}-b${RUN_NUMBER}"; TICKET="$ID" ;;
+            develop)
+              TYPE=develop; TAG="main-b${RUN_NUMBER}"; TICKET="$(ticket_from_commit)" ;;
+            release/*)
+              XY="${REF_NAME#release/}"
+              if [[ ! "$XY" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                echo "::error::Release branches must be release/<major>.<minor>. Got '$REF_NAME'."
+                exit 1
+              fi
+              # .version may carry a patch (3.3.1 for a hotfix); otherwise x.y.0
+              FILE_VER="$(tr -d '[:space:]' < .version 2>/dev/null || true)"
+              if [[ "$FILE_VER" =~ ^${XY//./\\.}\.[0-9]+$ ]]; then VERSION="$FILE_VER"; else VERSION="${XY}.0"; fi
+              TYPE=release; TAG="NG-${VERSION}-b${RUN_NUMBER}"; TICKET="$(ticket_from_commit)" ;;
+            *)
+              echo "::error::Branch '$REF_NAME' is not built. Only feature/*, develop and release/* are."
+              exit 1 ;;
+          esac
+
+          {
+            echo "branch_type=$TYPE"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "image=${REGISTRY}/${OWNER_LC}/${SERVICE}"
+            echo "image_name=${OWNER_LC}/${SERVICE}"
+            echo "chart=$CHART"
+            echo "hanoi_branch=$REF_NAME"
+            echo "ticket=$TICKET"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Versioning" >> "$GITHUB_STEP_SUMMARY"
+          echo "Branch \`$REF_NAME\` ($TYPE) -> image \`${REGISTRY}/${OWNER_LC}/${SERVICE}:${TAG}\`, Jira \`${TICKET:-none}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify Jira ticket exists (feature branches)
+        if: steps.v.outputs.branch_type == 'feature'
+        env:
+          TICKET: ${{ steps.v.outputs.ticket }}
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_USERNAME: ${{ secrets.JIRA_USERNAME }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          if [[ -z "$JIRA_URL" || -z "$JIRA_USERNAME" || -z "$JIRA_API_TOKEN" ]]; then
+            echo "::warning::Jira secrets not set - skipping ticket existence check."
+            exit 0
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -u "$JIRA_USERNAME:$JIRA_API_TOKEN" "${JIRA_URL%/}/rest/api/2/issue/${TICKET}")
+          [[ "$code" == 200 ]] || { echo "::error::Jira ticket $TICKET not found or not accessible (HTTP $code)."; exit 1; }
+          echo "Jira ticket $TICKET exists."
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build, Scan & Push
+    needs: versioning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      IMAGE_REF: ${{ needs.versioning.outputs.image }}:${{ needs.versioning.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image (local only - not pushed until scans pass)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ env.IMAGE_REF }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.versioning.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+
+      - name: Container scan - report (all severities)
+        run: trivy image --scanners vuln,secret --format sarif --output trivy-image.sarif "$IMAGE_REF"
+
+      - name: Upload SARIF
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image.sarif
+          category: container-${{ needs.versioning.outputs.branch-type }}
+
+      - name: Container scan - gate (${{ inputs.block-severity }}, fixable)
+        env:
+          SEVERITY: ${{ inputs.block-severity }}
+        run: trivy image --scanners vuln,secret --severity "$SEVERITY" --ignore-unfixed --exit-code 1 "$IMAGE_REF"
+
+      - name: Generate SBOM (CycloneDX)
+        run: trivy image --format cyclonedx --output sbom.cdx.json "$IMAGE_REF"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 30
+
+      # ---------------- DAST against the container we just built ----------------
+      - name: Start container for DAST
+        if: inputs.dast
+        env:
+          PORT: ${{ inputs.app-port }}
+          HEALTH: ${{ inputs.health-path }}
+          RULES: ${{ inputs.zap-rules-file }}
+        id: dast-target
+        run: |
+          set -euo pipefail
+          docker run -d --name app-under-test --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges -p "${PORT}:${PORT}" "$IMAGE_REF"
+          for i in $(seq 1 30); do
+            if curl -fsS "http://localhost:${PORT}${HEALTH}" >/dev/null; then echo "App is up"; break; fi
+            [[ $i == 30 ]] && { docker logs app-under-test; echo "::error::App did not become healthy on :${PORT}${HEALTH}"; exit 1; }
+            sleep 2
+          done
+          [[ -f "$RULES" ]] && echo "rules=$RULES" >> "$GITHUB_OUTPUT" || echo "rules=" >> "$GITHUB_OUTPUT"
+
+      - name: DAST - OWASP ZAP baseline
+        if: inputs.dast
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: http://localhost:${{ inputs.app-port }}
+          rules_file_name: ${{ steps.dast-target.outputs.rules }}
+          # -I: WARN alerts are reported, only rules set to FAIL in rules.tsv block
+          cmd_options: -I
+          fail_action: true
+          allow_issue_writing: false
+          artifact_name: zap-baseline-report
+
+      - name: Stop DAST container
+        if: always() && inputs.dast
+        run: docker rm -f app-under-test || true
+
+      # ---------------- Everything passed: publish ----------------
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        id: push
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_REF"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d@ -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`$IMAGE_REF\` (\`$DIGEST\`)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  sign:
+    name: Sign & Attest
+    needs: [versioning, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write       # keyless signing (Sigstore Fulcio) - no private key to leak
+      attestations: write
+    env:
+      IMAGE: ${{ needs.versioning.outputs.image }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: sigstore/cosign-installer@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: sbom
+
+      - name: Cosign keyless sign
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attach SBOM as signed attestation
+        run: cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "${IMAGE}@${DIGEST}"
+
+      - name: Verify signature identity
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          # The certificate identity is THIS reusable workflow, so only images built
+          # by the central pipeline verify. Kyverno and the release bundle use the same rule.
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${OWNER}/ci-templates/.github/workflows/build-deploy.yml@" \
+            > /dev/null && echo "Signature verified."
+
+      - name: SLSA build provenance
+        if: inputs.provenance
+        continue-on-error: true   # not available for private repos on free plans
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.DIGEST }}
+          push-to-registry: true
+
+  # ---------------------------------------------------------------------------
+  update-hanoi:
+    name: Update Hanoi
+    needs: [versioning, build, sign]
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      HANOI_BRANCH: ${{ needs.versioning.outputs.hanoi-branch }}
+      CHART: ${{ needs.versioning.outputs.chart }}
+      IMAGE_NAME: ${{ needs.versioning.outputs.image-name }}
+      IMAGE_TAG: ${{ needs.versioning.outputs.tag }}
+      TICKET: ${{ needs.versioning.outputs.jira-ticket }}
+    steps:
+      - name: GitHub App token (Hanoi only)
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.CICD_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CICD_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.hanoi-repo }}
+          permission-contents: write
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.hanoi-repo }}
+          token: ${{ steps.app.outputs.token }}
+          path: hanoi
+          fetch-depth: 0
+
+      - name: Write image tag to Hanoi ${{ env.HANOI_BRANCH }}
+        working-directory: hanoi
+        run: |
+          set -euo pipefail
+          git config user.name  "devsecops-ci[bot]"
+          git config user.email "devsecops-ci[bot]@users.noreply.github.com"
+
+          # 1. Make sure the same-named Hanoi branch exists
+          if ! git ls-remote --exit-code --heads origin "$HANOI_BRANCH" >/dev/null; then
+            if [[ "$HANOI_BRANCH" == feature/* ]]; then
+              echo "Creating Hanoi branch $HANOI_BRANCH from develop"
+              git push origin "origin/develop:refs/heads/$HANOI_BRANCH" \
+                || echo "Branch was created concurrently by another repo - fine."
+            else
+              echo "::error::Hanoi branch '$HANOI_BRANCH' does not exist. Release branches must be created by Hanoi 'Propagate release branches'."
+              exit 1
+            fi
+          fi
+
+          VALUES="helm-charts/${CHART}/values.yaml"
+          CHART_FILE="helm-charts/${CHART}/Chart.yaml"
+
+          apply_tag() {
+            [[ -f "$VALUES" ]] || { echo "::error::$VALUES not found on Hanoi $HANOI_BRANCH"; return 1; }
+            # Keeps an optional YAML anchor (imageTag: &imageTag "...")
+            sed -i -E "s|^([[:space:]]*imageTag:[[:space:]]*(&imageTag[[:space:]]+)?).*$|\1\"${IMAGE_TAG}\"|" "$VALUES"
+            sed -i -E "s|^([[:space:]]*imageName:[[:space:]]*(&imageName[[:space:]]+)?).*$|\1\"${IMAGE_NAME}\"|" "$VALUES"
+            [[ -f "$CHART_FILE" ]] && sed -i -E "s|^appVersion:.*$|appVersion: \"${IMAGE_TAG}\"|" "$CHART_FILE"
+            return 0
+          }
+
+          # 2. Commit + push with retry: many repos write to the same Hanoi branch.
+          #    Reset-and-reapply avoids rebase conflicts entirely.
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin "$HANOI_BRANCH"
+            git checkout -q -B "$HANOI_BRANCH" "origin/$HANOI_BRANCH"
+            apply_tag
+            if git diff --quiet; then echo "Tag already set - nothing to do."; exit 0; fi
+            git diff
+            git commit -qam "chore: Update ${CHART} image tag to ${IMAGE_TAG}${TICKET:+ (${TICKET})}"
+            if git push -q origin "HEAD:${HANOI_BRANCH}"; then
+              echo "Hanoi \`$HANOI_BRANCH\`: \`$CHART\` -> \`$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt) - retrying"; sleep $((attempt * 3))
+          done
+          echo "::error::Could not push to Hanoi after 5 attempts"; exit 1
+
+  # ---------------------------------------------------------------------------
+  notify-jira:
+    name: Notify Jira
+    needs: [versioning, build, sign, update-hanoi]
+    if: always() && needs.versioning.outputs.jira-ticket != ''
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Comment on ticket
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_USERNAME: ${{ secrets.JIRA_USERNAME }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TICKET: ${{ needs.versioning.outputs.jira-ticket }}
+          OK: ${{ needs.build.result == 'success' && needs.sign.result == 'success' && needs.update-hanoi.result == 'success' }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          IMAGE: ${{ needs.versioning.outputs.image }}:${{ needs.versioning.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ -z "$JIRA_URL" || -z "$JIRA_USERNAME" || -z "$JIRA_API_TOKEN" ]]; then
+            echo "Jira secrets not set - skipping."; exit 0
+          fi
+          if [[ "$OK" == true ]]; then
+            TEXT=$(printf '(/) *Build, scan & deploy succeeded*\nRepository: %s\nBranch: %s\nImage: %s (signed, scanned, SBOM attached)\nHanoi branch: %s\n[View run|%s]' "$REPO" "$BRANCH" "$IMAGE" "$BRANCH" "$RUN_URL")
+          else
+            TEXT=$(printf '(x) *Build failed* - nothing was deployed\nRepository: %s\nBranch: %s\n[View failed run|%s]' "$REPO" "$BRANCH" "$RUN_URL")
+          fi
+          # jq builds the JSON so quotes/newlines in values cannot break the payload
+          jq -n --arg body "$TEXT" '{body: $body}' |
+            curl -sS --fail-with-body -X POST -u "$JIRA_USERNAME:$JIRA_API_TOKEN" \
+              -H "Content-Type: application/json" --data @- \
+              "${JIRA_URL%/}/rest/api/2/issue/${TICKET}/comment" > /dev/null
+          echo "Commented on $TICKET"

@@ -1,0 +1,395 @@
+# =============================================================================
+# Reusable PR security gate ("shift-left" checks). Nothing is built or deployed.
+#
+# Called from every service repo on pull_request. Order of checks:
+#   1. Governance      - PR title has Jira ID, source branch allowed, branch up to date
+#   2. Secret scan     - Gitleaks over the PR commit range
+#   3. SAST            - Semgrep (all languages) + CodeQL (per language)
+#   4. SCA + licences  - Dependency Review + Trivy fs + language-native audit
+#   5. IaC / config    - Hadolint (Dockerfile), Trivy config, zizmor (workflows)
+#   6. Tests           - unit tests + coverage threshold
+#   7. Quality gate    - SonarQube/SonarCloud (optional)
+#   8. PR Gate         - single required status check that aggregates all of the above
+#
+# Make ONLY "pr-checks / PR Gate" a required status check in the branch ruleset.
+# =============================================================================
+name: PR Checks
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "python | go | node | dotnet"
+        type: string
+        required: true
+      language-version:
+        description: "Toolchain version (e.g. 3.13, 1.27, 24, 9.0.x). Empty = read from go.mod / default."
+        type: string
+        default: ""
+      install-command:
+        description: "Command that installs dependencies before tests"
+        type: string
+        default: ""
+      test-command:
+        description: "Command that runs the unit tests (and fails under the coverage threshold)"
+        type: string
+        required: true
+      codeql-languages:
+        description: 'JSON list for CodeQL, e.g. ["python"], ["go"], ["javascript-typescript"], ["csharp"]. "[]" disables CodeQL.'
+        type: string
+        default: "[]"
+      dockerfile:
+        type: string
+        default: Dockerfile
+      fail-severity:
+        description: "Lowest severity that blocks the PR for SCA / IaC findings"
+        type: string
+        default: HIGH
+      sonar:
+        description: "Run the SonarQube/SonarCloud quality gate (needs SONAR_TOKEN + sonar-project.properties)"
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+
+permissions: {}
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  SEMGREP_IMAGE: "semgrep/semgrep:1.183.0"
+  TRIVY_VERSION: "v0.76.1"
+  ZIZMOR_VERSION: "1.31.1"
+  # Mirror first: ghcr.io rate-limits anonymous Trivy DB downloads.
+  TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  governance:
+    name: Governance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: PR title, source branch and freshness
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          JIRA_RE='[A-Z][A-Z0-9]+-[0-9]+'
+
+          if [[ "$HEAD_REF" == dependabot/* ]]; then
+            echo "Dependabot PR - Jira/branch rules skipped."
+            exit 0
+          fi
+
+          # 1. PR title must carry a Jira ID (it becomes the squash-commit message,
+          #    which is how the develop/release build finds the ticket).
+          if [[ ! "$PR_TITLE" =~ $JIRA_RE ]]; then
+            echo "::error::PR title must contain a Jira ID, e.g. 'CCBD-1234: Add login audit'. Got: '$PR_TITLE'"
+            exit 1
+          fi
+
+          # 2. Allowed source -> target combinations (see Unified Branching model).
+          ok=false
+          case "$BASE_REF" in
+            develop)
+              [[ "$HEAD_REF" =~ ^feature/${JIRA_RE}$ || "$HEAD_REF" =~ ^hotfix/${JIRA_RE}$ || "$HEAD_REF" =~ ^release/[0-9]+\.[0-9]+$ ]] && ok=true ;;
+            release/*)
+              [[ "$HEAD_REF" =~ ^hotfix/${JIRA_RE}$ || "$HEAD_REF" =~ ^feature/${JIRA_RE}$ ]] && ok=true ;;
+          esac
+          if [[ "$ok" != true ]]; then
+            echo "::error::Branch '$HEAD_REF' may not be merged into '$BASE_REF'. Use feature/<JIRA-ID> -> develop or hotfix/<JIRA-ID> -> release/<x.y>."
+            exit 1
+          fi
+
+          # 3. Branch must contain the latest target branch (org pre-merge check).
+          if ! git merge-base --is-ancestor "origin/$BASE_REF" "$HEAD_SHA"; then
+            echo "::error::'$HEAD_REF' is behind '$BASE_REF'. Run: git fetch && git merge origin/$BASE_REF (or rebase), then push."
+            exit 1
+          fi
+          echo "Governance checks passed."
+
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Gitleaks (checksum verified)
+        run: |
+          set -euo pipefail
+          V="$GITLEAKS_VERSION"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${V}"
+          curl -sSfLO "$base/gitleaks_${V}_linux_x64.tar.gz"
+          curl -sSfLO "$base/gitleaks_${V}_checksums.txt"
+          grep " gitleaks_${V}_linux_x64.tar.gz\$" "gitleaks_${V}_checksums.txt" | sha256sum -c -
+          tar -xzf "gitleaks_${V}_linux_x64.tar.gz" gitleaks
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Scan commits in this PR
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gitleaks git . --log-opts="origin/${BASE_REF}..${HEAD_SHA}" \
+            --redact --verbose --exit-code 1 \
+            --report-format sarif --report-path gitleaks.sarif
+
+      - name: Upload SARIF
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: gitleaks.sarif
+          category: secrets
+
+  # ---------------------------------------------------------------------------
+  sast-semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Semgrep scan
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan --metrics=off \
+              --config p/default --config p/owasp-top-ten --config p/secrets \
+              --sarif --output semgrep.sarif
+
+      - name: Upload SARIF
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Gate on ERROR-severity findings
+        run: |
+          n=$(jq '[.runs[].results[] | select(.level == "error")] | length' semgrep.sarif)
+          echo "Semgrep ERROR findings: $n"
+          if [[ "$n" -gt 0 ]]; then
+            jq -r '.runs[].results[] | select(.level=="error") | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)  \(.ruleId)"' semgrep.sarif
+            echo "::error::Semgrep found $n blocking issue(s). See the Security tab or the list above."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  sast-codeql:
+    name: SAST (CodeQL ${{ matrix.language }})
+    if: inputs.codeql-languages != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(inputs.codeql-languages) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          # Go has no "none" mode; everything else can be analysed without a build.
+          build-mode: ${{ matrix.language == 'go' && 'autobuild' || 'none' }}
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: codeql-${{ matrix.language }}
+
+  # ---------------------------------------------------------------------------
+  sca:
+    name: SCA & licences
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Dependency Review (new vulnerable / disallowed deps in this PR)
+        uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+          deny-licenses: AGPL-1.0-only, AGPL-3.0-only, AGPL-3.0-or-later, SSPL-1.0
+
+      - uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+
+      - name: Trivy fs - report (all severities)
+        run: trivy fs --scanners vuln,license --format sarif --output trivy-fs.sarif .
+
+      - name: Upload SARIF
+        if: always() && hashFiles('trivy-fs.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Trivy fs - gate (fixable ${{ inputs.fail-severity }}+ only)
+        env:
+          SEVERITIES: ${{ inputs.fail-severity == 'CRITICAL' && 'CRITICAL' || 'HIGH,CRITICAL' }}
+        run: trivy fs --scanners vuln --severity "$SEVERITIES" --ignore-unfixed --exit-code 1 .
+
+  # ---------------------------------------------------------------------------
+  iac:
+    name: IaC & config scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Hadolint (Dockerfile best practice)
+        if: hashFiles(inputs.dockerfile) != ''
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: ${{ inputs.dockerfile }}
+          failure-threshold: error
+
+      - uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+
+      - name: Trivy config (Dockerfile, K8s, Helm, Terraform misconfig)
+        run: trivy config --severity HIGH,CRITICAL --exit-code 1 .
+
+      - name: zizmor (GitHub Actions workflow security)
+        run: |
+          cfg=()
+          [[ -f .github/zizmor.yml ]] && cfg=(--config .github/zizmor.yml)
+          pipx run "zizmor==${ZIZMOR_VERSION}" "${cfg[@]}" --offline --min-severity high .github/workflows
+
+  # ---------------------------------------------------------------------------
+  tests:
+    name: Unit tests & native audit (${{ inputs.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - if: inputs.language == 'python'
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.language-version || '3.13' }}
+      - if: inputs.language == 'go'
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ inputs.language-version }}
+          go-version-file: ${{ inputs.language-version == '' && 'go.mod' || '' }}
+      - if: inputs.language == 'node'
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.language-version || '24' }}
+      - if: inputs.language == 'dotnet'
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ inputs.language-version || '9.0.x' }}
+
+      - name: Install dependencies
+        if: inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - name: Run tests
+        run: ${{ inputs.test-command }}
+
+      # Reachability-aware / ecosystem-native vulnerability audit
+      - name: Native dependency audit
+        env:
+          LANGUAGE: ${{ inputs.language }}
+        run: |
+          set -euo pipefail
+          case "$LANGUAGE" in
+            python) pipx run pip-audit==2.10.1 -r requirements.txt --strict ;;
+            go)     go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./... ;;
+            node)   npm audit --omit=dev --audit-level=high ;;
+            dotnet)
+              dotnet list package --vulnerable --include-transitive | tee audit.txt
+              ! grep -q "has the following vulnerable packages" audit.txt ;;
+            *) echo "No native audit for '$LANGUAGE'" ;;
+          esac
+
+  # ---------------------------------------------------------------------------
+  sonar:
+    name: Quality gate (Sonar)
+    if: inputs.sonar
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+        with:
+          args: -Dsonar.qualitygate.wait=true
+
+  # ---------------------------------------------------------------------------
+  gate:
+    name: PR Gate
+    if: always()
+    needs: [governance, secret-scan, sast-semgrep, sast-codeql, sca, iac, tests, sonar]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: All required checks passed?
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$NEEDS" | jq '[.[] | select(.result == "failure" or .result == "cancelled")] | length')
+          if [[ "$bad" -gt 0 ]]; then
+            echo "::error::$bad check(s) failed. The PR cannot be merged."
+            exit 1
+          fi
