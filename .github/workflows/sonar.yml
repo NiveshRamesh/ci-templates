@@ -1,0 +1,116 @@
+# Reusable SonarQube / SonarQube Cloud analysis: code quality, bugs, vulnerabilities,
+# security hotspots and coverage. Runs the tests itself so Sonar gets the coverage report.
+#
+# Runs on pull requests (PR decoration + quality gate on new code) and on pushes to
+# develop / release/* (the long-lived branch analysis that the Sonar reports are built from).
+# Without SONAR_TOKEN (not configured yet, or a Dependabot PR) the job passes with a warning.
+name: Sonar
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "python | go | node | dotnet"
+        type: string
+        required: true
+      language-version:
+        type: string
+        default: ""
+      install-command:
+        type: string
+        default: ""
+      test-command:
+        description: "Must write the coverage file named in sonar-project.properties"
+        type: string
+        required: true
+      wait-for-quality-gate:
+        description: "Fail the job when the Sonar quality gate fails"
+        type: boolean
+        default: true
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+
+permissions: {}
+
+jobs:
+  sonar:
+    name: Sonar quality gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Sonar configured?
+        id: cfg
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [[ -z "$SONAR_TOKEN" ]]; then
+            echo "::warning::SONAR_TOKEN is not available (not configured, or a Dependabot PR). Sonar analysis skipped."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # Sonar needs history for blame and new-code detection
+          persist-credentials: false
+
+      - if: steps.cfg.outputs.enabled == 'true' && inputs.language == 'python'
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.language-version || '3.13' }}
+      - if: steps.cfg.outputs.enabled == 'true' && inputs.language == 'go'
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ inputs.language-version }}
+          go-version-file: ${{ inputs.language-version == '' && 'go.mod' || '' }}
+      - if: steps.cfg.outputs.enabled == 'true' && inputs.language == 'node'
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.language-version || '24' }}
+      - if: steps.cfg.outputs.enabled == 'true' && inputs.language == 'dotnet'
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ inputs.language-version || '9.0.x' }}
+
+      - name: Install dependencies
+        if: steps.cfg.outputs.enabled == 'true' && inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - name: Run tests with coverage
+        if: steps.cfg.outputs.enabled == 'true'
+        run: ${{ inputs.test-command }}
+
+      - name: Sonar scan
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+        with:
+          args: >-
+            -Dsonar.qualitygate.wait=${{ inputs.wait-for-quality-gate }}
+            -Dsonar.qualitygate.timeout=300
+
+      - name: Link to the Sonar report
+        if: always() && steps.cfg.outputs.enabled == 'true'
+        env:
+          HOST: ${{ secrets.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+          PR: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          key=$(sed -n 's/^sonar.projectKey=//p' sonar-project.properties | tr -d '\r')
+          if [[ -n "$PR" ]]; then url="$HOST/project/overview?id=$key&pullRequest=$PR"
+          else url="$HOST/project/overview?id=$key&branch=$BRANCH"; fi
+          {
+            echo "### Sonar"
+            echo "- Overview: $url"
+            echo "- Vulnerabilities: $HOST/project/issues?id=$key&types=VULNERABILITY&resolved=false"
+            echo "- Security hotspots: $HOST/project/security_hotspots?id=$key"
+          } >> "$GITHUB_STEP_SUMMARY"
