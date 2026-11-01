@@ -307,7 +307,7 @@ jobs:
       IMAGE: ${{ needs.versioning.outputs.image }}
       DIGEST: ${{ needs.build.outputs.digest }}
     steps:
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v4.1.2
 
       - uses: docker/login-action@v4
         with:
