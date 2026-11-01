@@ -51,7 +51,6 @@ permissions: {}
 env:
   GITLEAKS_VERSION: "8.30.1"
   SEMGREP_IMAGE: "semgrep/semgrep:1.183.0"
-  TRIVY_VERSION: "v0.76.1"
   ZIZMOR_VERSION: "1.31.1"
   # Mirror first: ghcr.io rate-limits anonymous Trivy DB downloads.
   TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
@@ -244,7 +243,7 @@ jobs:
 
       - uses: aquasecurity/setup-trivy@v0.3.1
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: "v0.76.1"
           cache: true
 
       - name: Trivy fs - report (all severities)
@@ -283,7 +282,7 @@ jobs:
 
       - uses: aquasecurity/setup-trivy@v0.3.1
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: "v0.76.1"
           cache: true
 
       - name: Trivy config (Dockerfile, K8s, Helm, Terraform misconfig)
@@ -326,10 +325,14 @@ jobs:
 
       - name: Install dependencies
         if: inputs.install-command != ''
-        run: ${{ inputs.install-command }}
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: bash -euo pipefail -c "$INSTALL_COMMAND"
 
       - name: Run tests
-        run: ${{ inputs.test-command }}
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: bash -euo pipefail -c "$TEST_COMMAND"
 
       # Reachability-aware / ecosystem-native vulnerability audit
       - name: Native dependency audit

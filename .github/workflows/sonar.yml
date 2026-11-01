@@ -81,11 +81,15 @@ jobs:
 
       - name: Install dependencies
         if: steps.cfg.outputs.enabled == 'true' && inputs.install-command != ''
-        run: ${{ inputs.install-command }}
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: bash -euo pipefail -c "$INSTALL_COMMAND"
 
       - name: Run tests with coverage
         if: steps.cfg.outputs.enabled == 'true'
-        run: ${{ inputs.test-command }}
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: bash -euo pipefail -c "$TEST_COMMAND"
 
       - name: Sonar scan
         if: steps.cfg.outputs.enabled == 'true'
