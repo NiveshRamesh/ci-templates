@@ -180,6 +180,7 @@ jobs:
         run: |
           # Semgrep puts the severity on the rule (defaultConfiguration.level), not on
           # each result, so resolve it per result before filtering.
+          # shellcheck disable=SC2016 # $lvl is a jq variable, not a shell one
           errors='[.runs[] | ((.tool.driver.rules // []) | map({(.id): (.defaultConfiguration.level // "warning")}) | add // {}) as $lvl
                    | .results[] | select((.level // $lvl[.ruleId] // "warning") == "error")]'
           n=$(jq "$errors | length" semgrep.sarif)
