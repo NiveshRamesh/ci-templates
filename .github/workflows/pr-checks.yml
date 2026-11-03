@@ -178,10 +178,14 @@ jobs:
 
       - name: Gate on ERROR-severity findings
         run: |
-          n=$(jq '[.runs[].results[] | select(.level == "error")] | length' semgrep.sarif)
+          # Semgrep puts the severity on the rule (defaultConfiguration.level), not on
+          # each result, so resolve it per result before filtering.
+          errors='[.runs[] | ((.tool.driver.rules // []) | map({(.id): (.defaultConfiguration.level // "warning")}) | add // {}) as $lvl
+                   | .results[] | select((.level // $lvl[.ruleId] // "warning") == "error")]'
+          n=$(jq "$errors | length" semgrep.sarif)
           echo "Semgrep ERROR findings: $n"
           if [[ "$n" -gt 0 ]]; then
-            jq -r '.runs[].results[] | select(.level=="error") | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)  \(.ruleId)"' semgrep.sarif
+            jq -r "$errors"' | .[] | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)  \(.ruleId)"' semgrep.sarif
             echo "::error::Semgrep found $n blocking issue(s). See the Security tab or the list above."
             exit 1
           fi
