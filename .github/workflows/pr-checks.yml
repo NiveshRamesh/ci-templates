@@ -178,10 +178,15 @@ jobs:
 
       - name: Gate on ERROR-severity findings
         run: |
-          n=$(jq '[.runs[].results[] | select(.level == "error")] | length' semgrep.sarif)
+          # Semgrep puts the severity on the rule (defaultConfiguration.level), not on
+          # each result, so resolve it per result before filtering.
+          # shellcheck disable=SC2016 # $lvl is a jq variable, not a shell one
+          errors='[.runs[] | ((.tool.driver.rules // []) | map({(.id): (.defaultConfiguration.level // "warning")}) | add // {}) as $lvl
+                   | .results[] | select((.level // $lvl[.ruleId] // "warning") == "error")]'
+          n=$(jq "$errors | length" semgrep.sarif)
           echo "Semgrep ERROR findings: $n"
           if [[ "$n" -gt 0 ]]; then
-            jq -r '.runs[].results[] | select(.level=="error") | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)  \(.ruleId)"' semgrep.sarif
+            jq -r "$errors"' | .[] | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)  \(.ruleId)"' semgrep.sarif
             echo "::error::Semgrep found $n blocking issue(s). See the Security tab or the list above."
             exit 1
           fi
@@ -342,7 +347,7 @@ jobs:
           set -euo pipefail
           case "$LANGUAGE" in
             python) pipx run pip-audit==2.10.1 -r requirements.txt --strict ;;
-            go)     go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./... ;;
+            go)     go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... ;;
             node)   npm audit --omit=dev --audit-level=high ;;
             dotnet)
               dotnet list package --vulnerable --include-transitive | tee audit.txt
