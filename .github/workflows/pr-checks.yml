@@ -8,7 +8,7 @@
 #   4. SCA + licences  - Dependency Review + Trivy fs + language-native audit
 #   5. IaC / config    - Hadolint (Dockerfile), Trivy config, zizmor (workflows)
 #   6. Tests           - unit tests + coverage threshold
-#   7. Quality gate    - SonarQube/SonarCloud (optional)
+#   7. Quality gate    - SonarQube/SonarCloud: separate reusable workflow, sonar.yml
 #   8. PR Gate         - single required status check that aggregates all of the above
 #
 # Make ONLY "pr-checks / PR Gate" a required status check in the branch ruleset.
@@ -45,22 +45,12 @@ on:
         description: "Lowest severity that blocks the PR for SCA / IaC findings"
         type: string
         default: HIGH
-      sonar:
-        description: "Run the SonarQube/SonarCloud quality gate (needs SONAR_TOKEN + sonar-project.properties)"
-        type: boolean
-        default: false
-    secrets:
-      SONAR_TOKEN:
-        required: false
-      SONAR_HOST_URL:
-        required: false
 
 permissions: {}
 
 env:
   GITLEAKS_VERSION: "8.30.1"
   SEMGREP_IMAGE: "semgrep/semgrep:1.183.0"
-  TRIVY_VERSION: "v0.76.1"
   ZIZMOR_VERSION: "1.31.1"
   # Mirror first: ghcr.io rate-limits anonymous Trivy DB downloads.
   TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
@@ -253,7 +243,7 @@ jobs:
 
       - uses: aquasecurity/setup-trivy@v0.3.1
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: "v0.76.1"
           cache: true
 
       - name: Trivy fs - report (all severities)
@@ -292,7 +282,7 @@ jobs:
 
       - uses: aquasecurity/setup-trivy@v0.3.1
         with:
-          version: ${{ env.TRIVY_VERSION }}
+          version: "v0.76.1"
           cache: true
 
       - name: Trivy config (Dockerfile, K8s, Helm, Terraform misconfig)
@@ -335,10 +325,14 @@ jobs:
 
       - name: Install dependencies
         if: inputs.install-command != ''
-        run: ${{ inputs.install-command }}
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: bash -euo pipefail -c "$INSTALL_COMMAND"
 
       - name: Run tests
-        run: ${{ inputs.test-command }}
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: bash -euo pipefail -c "$TEST_COMMAND"
 
       # Reachability-aware / ecosystem-native vulnerability audit
       - name: Native dependency audit
@@ -357,29 +351,10 @@ jobs:
           esac
 
   # ---------------------------------------------------------------------------
-  sonar:
-    name: Quality gate (Sonar)
-    if: inputs.sonar
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: SonarSource/sonarqube-scan-action@v8
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || 'https://sonarcloud.io' }}
-        with:
-          args: -Dsonar.qualitygate.wait=true
-
-  # ---------------------------------------------------------------------------
   gate:
     name: PR Gate
     if: always()
-    needs: [governance, secret-scan, sast-semgrep, sast-codeql, sca, iac, tests, sonar]
+    needs: [governance, secret-scan, sast-semgrep, sast-codeql, sca, iac, tests]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
