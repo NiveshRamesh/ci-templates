@@ -46,7 +46,7 @@ on:
         type: string
         default: .zap/rules.tsv
       block-severity:
-        description: "Image vulnerabilities (with a fix available) at these levels block the push"
+        description: "NEW image vulnerabilities at these levels (vs the image deployed for this branch) block the push"
         type: string
         default: CRITICAL,HIGH
       provenance:
@@ -227,10 +227,83 @@ jobs:
           sarif_file: trivy-image.sarif
           category: container-${{ needs.versioning.outputs.branch-type }}
 
-      - name: Container scan - gate (${{ inputs.block-severity }}, fixable)
+      - name: Container scan - secrets baked into the image (always blocking)
+        run: trivy image --quiet --scanners secret --exit-code 1 "$IMAGE_REF"
+
+      # Baseline = the image Hanoi currently runs for this branch (feature branches without
+      # their own Hanoi branch yet compare against develop). CVEs disclosed after that image
+      # was built are in both scans, so they do not block; the nightly scan tickets them.
+      - name: Find the baseline image in Hanoi
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          HANOI: ${{ inputs.hanoi-repo }}
+          CHART: ${{ needs.versioning.outputs.chart }}
+          BRANCH: ${{ needs.versioning.outputs.hanoi-branch }}
+        run: |
+          set -uo pipefail
+          for br in "$BRANCH" develop; do
+            v=$(gh api -H 'Accept: application/vnd.github.raw' "repos/$OWNER/$HANOI/contents/helm-charts/$CHART/values.yaml?ref=$br" 2>/dev/null) || continue
+            ref="$(yq '.vunet.registry' <<<"$v")/$(yq '.vunet.imageName' <<<"$v"):$(yq '.vunet.imageTag' <<<"$v")"
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+            echo "label=\`$ref\` (Hanoi $br)" >> "$GITHUB_OUTPUT"
+            echo "Baseline: $ref (Hanoi $br)"
+            exit 0
+          done
+          echo "::notice::No baseline image found in Hanoi; gating on all fixable findings."
+          echo "label=none found, all fixable findings block" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Container scan - gate (new ${{ inputs.block-severity }} findings only)
         env:
           SEVERITY: ${{ inputs.block-severity }}
-        run: trivy image --scanners vuln,secret --severity "$SEVERITY" --ignore-unfixed --exit-code 1 "$IMAGE_REF"
+          BASE_REF_IMAGE: ${{ steps.baseline.outputs.ref }}
+          HEAD_JSON: trivy-image-head.json
+          BASE_JSON: trivy-image-base.json
+          BASE_LABEL: ${{ steps.baseline.outputs.label }}
+          TITLE: Image vulnerabilities introduced by this build
+        run: |
+          set -euo pipefail
+          ignore=()
+          [[ -f .trivyignore.yaml ]] && ignore=(--ignorefile .trivyignore.yaml)
+          trivy image --quiet --scanners vuln --severity "$SEVERITY" "${ignore[@]}" --format json --output "$HEAD_JSON" "$IMAGE_REF"
+          NO_BASE=0
+          if [[ -z "$BASE_REF_IMAGE" ]] || ! trivy image --quiet --scanners vuln --severity "$SEVERITY" "${ignore[@]}" --format json --output "$BASE_JSON" "$BASE_REF_IMAGE"; then
+            [[ -n "$BASE_REF_IMAGE" ]] && echo "::warning::Could not scan baseline $BASE_REF_IMAGE; gating on all fixable findings."
+            echo '{"Results":[]}' > "$BASE_JSON"; NO_BASE=1
+          fi
+          export NO_BASE
+          # shellcheck disable=SC2016 # $base / $old / $k are jq variables
+          new_json=$(jq --slurpfile base "$BASE_JSON" 'def vulns: [.Results[]? as $t | $t.Vulnerabilities[]? | {id: .VulnerabilityID, pkg: .PkgName, sev: .Severity, installed: .InstalledVersion, fixed: (.FixedVersion // ""), target: $t.Target}];
+          ($base[0] | vulns | map(.id + "|" + .pkg)) as $old
+          | [vulns[] | select((.id + "|" + .pkg) as $k | any($old[]; . == $k) | not)]
+          | unique_by(.id + "|" + .pkg)
+          | map(. + {blocking: (.fixed != "" or (.sev == "CRITICAL" and env.NO_BASE != "1"))})' "$HEAD_JSON")
+          total_head=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$HEAD_JSON")
+          n_new=$(jq 'length' <<<"$new_json")
+          n_block=$(jq '[.[] | select(.blocking)] | length' <<<"$new_json")
+          {
+            echo "### $TITLE"
+            echo "Baseline: $BASE_LABEL"
+            echo "- HIGH/CRITICAL findings now: $total_head (already present before this change are not blocking)"
+            echo "- New with this change: $n_new, blocking: $n_block"
+            if [[ "$n_new" -gt 0 ]]; then
+              echo
+              echo "| Blocks | Severity | CVE | Package | Installed | Fixed in | Target |"
+              echo "| --- | --- | --- | --- | --- | --- | --- |"
+              jq -r '.[] | "| \(if .blocking then "yes" else "no" end) | \(.sev) | \(.id) | \(.pkg) | \(.installed) | \(if .fixed == "" then "no fix yet" else .fixed end) | \(.target) |"' <<<"$new_json"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$n_block" -gt 0 ]]; then
+            echo "::error::$n_block new vulnerability finding(s) introduced by this change. Upgrade to the fixed version, or record an exception with an expiry date in .trivyignore.yaml."
+            exit 1
+          fi
 
       - name: Generate SBOM (CycloneDX)
         run: trivy image --format cyclonedx --output sbom.cdx.json "$IMAGE_REF"
@@ -277,12 +350,6 @@ jobs:
         run: docker rm -f app-under-test || true
 
       # ---------------- Everything passed: publish ----------------
-      - uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Push image
         id: push
         run: |
