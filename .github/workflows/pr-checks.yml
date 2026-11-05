@@ -5,7 +5,7 @@
 #   1. Governance      - PR title has Jira ID, source branch allowed, branch up to date
 #   2. Secret scan     - Gitleaks over the PR commit range
 #   3. SAST            - Semgrep (all languages) + CodeQL (per language)
-#   4. SCA + licences  - Dependency Review + Trivy fs + language-native audit
+#   4. SCA + licences  - Trivy fs: block only NEW fixable HIGH/CRITICAL; Dependency Review: licences
 #   5. IaC / config    - Hadolint (Dockerfile), Trivy config, zizmor (workflows)
 #   6. Tests           - unit tests + coverage threshold
 #   7. Quality gate    - SonarQube/SonarCloud: separate reusable workflow, sonar.yml
@@ -42,7 +42,7 @@ on:
         type: string
         default: Dockerfile
       fail-severity:
-        description: "Lowest severity that blocks the PR for SCA / IaC findings"
+        description: "Lowest severity that blocks the PR for SCA findings it introduces (HIGH or CRITICAL)"
         type: string
         default: HIGH
 
@@ -239,12 +239,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Dependency Review (new vulnerable / disallowed deps in this PR)
+      - name: Dependency Review (licences of dependencies added in this PR)
         uses: actions/dependency-review-action@v5
         with:
-          fail-on-severity: high
+          # Vulnerabilities are gated by the Trivy comparison below, which honours
+          # .trivyignore.yaml exceptions; this action only enforces the licence policy.
+          vulnerability-check: false
+          license-check: true
           comment-summary-in-pr: on-failure
           deny-licenses: AGPL-1.0-only, AGPL-3.0-only, AGPL-3.0-or-later, SSPL-1.0
+
+      - name: Check out the target branch (baseline for the comparison)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .base
+          persist-credentials: false
 
       - uses: aquasecurity/setup-trivy@v0.3.1
         with:
@@ -252,7 +262,7 @@ jobs:
           cache: true
 
       - name: Trivy fs - report (all severities)
-        run: trivy fs --scanners vuln,license --format sarif --output trivy-fs.sarif .
+        run: trivy fs --scanners vuln,license --skip-dirs .base --format sarif --output trivy-fs.sarif .
 
       - name: Upload SARIF
         if: always() && hashFiles('trivy-fs.sarif') != ''
@@ -261,10 +271,47 @@ jobs:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
 
-      - name: Trivy fs - gate (fixable ${{ inputs.fail-severity }}+ only)
+      # Block only what this PR introduces: scan the PR and its target branch, compare.
+      # Findings already on the target branch are tracked by the nightly scan instead.
+      - name: Trivy fs - gate (new ${{ inputs.fail-severity }}+ findings only)
         env:
           SEVERITIES: ${{ inputs.fail-severity == 'CRITICAL' && 'CRITICAL' || 'HIGH,CRITICAL' }}
-        run: trivy fs --scanners vuln --severity "$SEVERITIES" --ignore-unfixed --exit-code 1 .
+          HEAD_JSON: trivy-head.json
+          BASE_JSON: trivy-base.json
+          BASE_LABEL: target branch ${{ github.base_ref }}
+          TITLE: Dependency vulnerabilities introduced by this PR
+          NO_BASE: "0"
+        run: |
+          set -euo pipefail
+          ignore=()
+          [[ -f .trivyignore.yaml ]] && ignore=(--ignorefile .trivyignore.yaml)
+          trivy fs --quiet --scanners vuln --severity "$SEVERITIES" "${ignore[@]}" --skip-dirs .base --format json --output "$HEAD_JSON" .
+          trivy fs --quiet --scanners vuln --severity "$SEVERITIES" "${ignore[@]}" --format json --output "$BASE_JSON" .base
+          # shellcheck disable=SC2016 # $base / $old / $k are jq variables
+          new_json=$(jq --slurpfile base "$BASE_JSON" 'def vulns: [.Results[]? as $t | $t.Vulnerabilities[]? | {id: .VulnerabilityID, pkg: .PkgName, sev: .Severity, installed: .InstalledVersion, fixed: (.FixedVersion // ""), target: $t.Target}];
+          ($base[0] | vulns | map(.id + "|" + .pkg)) as $old
+          | [vulns[] | select((.id + "|" + .pkg) as $k | any($old[]; . == $k) | not)]
+          | unique_by(.id + "|" + .pkg)
+          | map(. + {blocking: (.fixed != "" or (.sev == "CRITICAL" and env.NO_BASE != "1"))})' "$HEAD_JSON")
+          total_head=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$HEAD_JSON")
+          n_new=$(jq 'length' <<<"$new_json")
+          n_block=$(jq '[.[] | select(.blocking)] | length' <<<"$new_json")
+          {
+            echo "### $TITLE"
+            echo "Baseline: $BASE_LABEL"
+            echo "- HIGH/CRITICAL findings now: $total_head (already present before this change are not blocking)"
+            echo "- New with this change: $n_new, blocking: $n_block"
+            if [[ "$n_new" -gt 0 ]]; then
+              echo
+              echo "| Blocks | Severity | CVE | Package | Installed | Fixed in | Target |"
+              echo "| --- | --- | --- | --- | --- | --- | --- |"
+              jq -r '.[] | "| \(if .blocking then "yes" else "no" end) | \(.sev) | \(.id) | \(.pkg) | \(.installed) | \(if .fixed == "" then "no fix yet" else .fixed end) | \(.target) |"' <<<"$new_json"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$n_block" -gt 0 ]]; then
+            echo "::error::$n_block new vulnerability finding(s) introduced by this change. Upgrade to the fixed version, or record an exception with an expiry date in .trivyignore.yaml."
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   iac:
@@ -339,12 +386,15 @@ jobs:
           TEST_COMMAND: ${{ inputs.test-command }}
         run: bash -euo pipefail -c "$TEST_COMMAND"
 
-      # Reachability-aware / ecosystem-native vulnerability audit
-      - name: Native dependency audit
+      # Ecosystem-native audit (govulncheck is reachability-aware). Reported as a warning,
+      # not blocking: it cannot tell findings this PR introduced from existing ones, and
+      # the Trivy comparison in the SCA job is the single blocking vulnerability gate.
+      - name: Native dependency audit (report only)
         env:
           LANGUAGE: ${{ inputs.language }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          audit() {
           case "$LANGUAGE" in
             python) pipx run pip-audit==2.10.1 -r requirements.txt --strict ;;
             go)     go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... ;;
@@ -354,6 +404,10 @@ jobs:
               ! grep -q "has the following vulnerable packages" audit.txt ;;
             *) echo "No native audit for '$LANGUAGE'" ;;
           esac
+          }
+          if ! audit; then
+            echo "::warning::The $LANGUAGE audit reports known vulnerabilities (see the log). Not blocking: new findings are gated by 'SCA & licences', existing ones are tracked by the nightly scan."
+          fi
 
   # ---------------------------------------------------------------------------
   gate:
