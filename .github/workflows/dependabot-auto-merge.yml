@@ -1,0 +1,60 @@
+# Reusable: let Dependabot's low-risk updates merge themselves.
+#
+# Auto-merge is switched on only when ALL of these hold:
+#   - the PR was opened by Dependabot and the latest push came from Dependabot;
+#   - the highest change in the PR is a semver PATCH (a grouped PR with any minor or major
+#     update counts as that, so it waits for a human);
+#   - the package ecosystem is in the caller's allow-list.
+# GitHub then merges only after every required check passes (PR Gate, Sonar if required),
+# and the branch ruleset still applies. If anyone else pushes to a Dependabot PR,
+# auto-merge is switched off so a human reviews it.
+name: Dependabot auto-merge
+
+on:
+  workflow_call:
+    inputs:
+      allowed-ecosystems:
+        description: 'JSON list of ecosystems whose patch updates may merge themselves, e.g. ["github_actions","pip"]'
+        type: string
+        default: '["github_actions"]'
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    name: Auto-merge patch updates
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v3
+
+      - name: Enable or disable auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          ACTOR: ${{ github.actor }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          DEPS: ${{ steps.meta.outputs.dependency-names }}
+          GROUP: ${{ steps.meta.outputs.dependency-group }}
+          ALLOWED: ${{ inputs.allowed-ecosystems }}
+        run: |
+          set -euo pipefail
+          what="${GROUP:+group $GROUP: }$DEPS ($ECOSYSTEM, $UPDATE_TYPE)"
+          if [[ "$ACTOR" != "dependabot[bot]" ]]; then
+            echo "$ACTOR pushed to this Dependabot PR: auto-merge off, a human must review." | tee -a "$GITHUB_STEP_SUMMARY"
+            gh pr merge --disable-auto "$PR_URL" || true
+            exit 0
+          fi
+          # shellcheck disable=SC2016 # $e is a jq variable
+          if [[ "$UPDATE_TYPE" == "version-update:semver-patch" ]] && jq -e --arg e "$ECOSYSTEM" 'any(.[]; . == $e)' <<<"$ALLOWED" >/dev/null; then
+            echo "Auto-merge on for $what. GitHub merges it once every required check passes." | tee -a "$GITHUB_STEP_SUMMARY"
+            gh pr merge --auto --squash "$PR_URL"
+          else
+            echo "Not auto-merged: $what. Needs a human review." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
