@@ -287,6 +287,17 @@ jobs:
           [[ -f .trivyignore.yaml ]] && ignore=(--ignorefile .trivyignore.yaml)
           trivy fs --quiet --scanners vuln --severity "$SEVERITIES" "${ignore[@]}" --skip-dirs .base --format json --output "$HEAD_JSON" .
           trivy fs --quiet --scanners vuln --severity "$SEVERITIES" "${ignore[@]}" --format json --output "$BASE_JSON" .base
+          # Expired exceptions do not block here (after a merge the finding is in the baseline).
+          # They warn on every run; the release gate refuses releases with overdue exceptions.
+          if [[ -f .trivyignore.yaml ]]; then
+            # shellcheck disable=SC2016 # $today / $head / $ids / $id are jq variables
+            yq -o=json '.vulnerabilities // []' .trivyignore.yaml \
+              | jq -r --arg today "$(date -u +%F)" --slurpfile head "$HEAD_JSON" '
+                  ($head[0] | [.Results[]?.Vulnerabilities[]?.VulnerabilityID]) as $ids
+                  | .[] | .id as $id
+                  | select(.expired_at != null and (.expired_at | tostring) < $today and any($ids[]; . == $id))
+                  | "::warning::Exception for \(.id) in .trivyignore.yaml expired on \(.expired_at) and the finding is still present. Fix it or renew the exception. \(.statement // "")"'
+          fi
           # shellcheck disable=SC2016 # $base / $old / $k are jq variables
           new_json=$(jq --slurpfile base "$BASE_JSON" 'def vulns: [.Results[]? as $t | $t.Vulnerabilities[]? | {id: .VulnerabilityID, pkg: .PkgName, sev: .Severity, installed: .InstalledVersion, fixed: (.FixedVersion // ""), target: $t.Target}];
           ($base[0] | vulns | map(.id + "|" + .pkg)) as $old
