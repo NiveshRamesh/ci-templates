@@ -342,16 +342,20 @@ jobs:
             [[ $i == 30 ]] && { docker logs app-under-test; echo "::error::App did not become healthy on :${PORT}${HEALTH}"; exit 1; }
             sleep 2
           done
-          [[ -f "$RULES" ]] && echo "rules=$RULES" >> "$GITHUB_OUTPUT" || echo "rules=" >> "$GITHUB_OUTPUT"
+          # Pass the rules file to ZAP ourselves: action-baseline only adds "-c <file>" when the
+          # file contains an IGNORE rule, so a file with only FAIL/WARN rules was silently dropped.
+          if [[ -f "$RULES" ]]; then echo "opts=-I -c $RULES" >> "$GITHUB_OUTPUT"
+          else echo "::warning::No ZAP rules file at $RULES: every alert is a warning, DAST cannot fail."; echo "opts=-I" >> "$GITHUB_OUTPUT"; fi
 
       - name: DAST - OWASP ZAP baseline
         if: inputs.dast
         uses: zaproxy/action-baseline@v0.15.0
         with:
-          target: http://localhost:${{ inputs.app-port }}
-          rules_file_name: ${{ steps.dast-target.outputs.rules }}
+          # Start at the health path: it is a real 200 page. Header rules (10020, 10021, 10038...)
+          # skip 4xx/5xx responses, and "/" is a 404 on services without a root route.
+          target: http://localhost:${{ inputs.app-port }}${{ inputs.health-path }}
           # -I: WARN alerts are reported, only rules set to FAIL in rules.tsv block
-          cmd_options: -I
+          cmd_options: ${{ steps.dast-target.outputs.opts }}
           fail_action: true
           allow_issue_writing: false
           artifact_name: zap-baseline-report
